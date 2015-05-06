@@ -1,6 +1,93 @@
 'use strict';
-var _ = require('lodash');
+var _ = require('lodash'),
+    cls = require('continuation-local-storage');
+
 module.exports = function (Sequelize) {
+
+  if (_.isUndefined(Sequelize.cls) || _.isNull(Sequelize.cls)) {
+    Sequelize.cls = cls.createNamespace('sequelize-internal');
+  }
+
+  function doUpsert(dataItem, association, associationModel, mainEntity) {
+    if (!_.isUndefined(dataItem.Value)) {
+      return associationModel.find({
+        where: { Value: dataItem.Value }
+      })
+      .then(function (subEntity) {
+        if (subEntity) {
+          return mainEntity[association.associationType === 'HasMany' ? association.accessors.add : association.accessors.set].call(mainEntity, subEntity);
+        } else {
+          return mainEntity[association.accessors.create].call(mainEntity, dataItem, {});
+        }
+      });
+    } else {
+      if (!_.isUndefined(dataItem.isNewRecord)) {
+        return mainEntity[association.associationType === 'HasMany' ? association.accessors.add : association.accessors.set].call(mainEntity, dataItem);
+      } else {
+        if (_.isUndefined(dataItem.id)) {
+          if (_.isNumber(dataItem)) {
+            return mainEntity[association.accessors.set].bind(mainEntity)(dataItem);
+          } else  {
+           return mainEntity[association.accessors.create].bind(mainEntity)(dataItem);
+          }
+        } else {
+          return mainEntity[association.accessors.set].bind(mainEntity)(dataItem.id);
+        }
+      }
+    }
+  }
+
+  function doDelete(dataItem, association, associationModel) {
+    dataItem.set(association.identifierField, null);
+    var stillAlive = _(associationModel.attributes)
+    .filter(function (attribute) {
+      return !_.isUndefined(attribute.references);
+    })
+    .pluck('field')
+    .any(function (key) {
+      return !_.isNull(dataItem[key]);
+    });
+
+    if (stillAlive) {
+      return dataItem.save();
+    } else {
+      return dataItem.destroy();
+    }
+  }
+
+  function upsertSubEntities(mainEntity, associations, data) {
+    if (associations.length === 0) {
+      return Promise.resolve(mainEntity);
+    } else {
+      var promises = _(associations).map(function (associationKey) {
+        var associationData = data[associationKey],
+            association = this.associations[associationKey],
+            associationModel = association.target;
+
+        if (_.isArray(associationData)) {
+          var difference = _.filter(mainEntity[associationKey], function (item) {
+            return associationData.length === 0 ? true : _.any(associationData, function (item2) {
+              return item.Value !== item2.Value;
+            });
+          });
+          return Promise.join(Promise.all(_.map(associationData, function (dataItem) {
+            if (!_.isNull(dataItem)) {
+              return doUpsert(dataItem, association, associationModel, mainEntity);
+            }
+          })), Promise.all(_.map(difference, function (dataItem) {
+            return doDelete(dataItem, association, associationModel);
+          })));
+        } else if (!_.isNull(associationData) && !_.isUndefined(associationData)) {
+          return doUpsert(associationData, association, associationModel, mainEntity);
+        }
+      }, this)  // jshint ignore:line
+      .flatten()
+      .value();
+
+      return Promise.all(promises)
+      .return(mainEntity);
+    }
+  }
 
   function sortWhere (where, includes, virtuals, operator) {
     var model = this; // jshint ignore:line
@@ -46,6 +133,74 @@ module.exports = function (Sequelize) {
   }
 
   Sequelize.hook('afterInit', function (sequelize) {
+    sequelize.helpers = {
+      transaction: function (callback) {
+        var isInTransaction = !_.isUndefined(Sequelize.cls.get('transaction'));
+        if (isInTransaction && sequelize.getDialect() === 'sqlite') { // SQLite doesn't support nested transactions.
+          return callback();
+        } else {
+          return sequelize.transaction(function () {
+            return callback();
+          });
+        }
+      },
+      createomatic: function (data) {
+        var model = this;
+        return sequelize.helpers.transaction(function () {
+          return model.constructor.prototype.create.call(model, data)
+          .bind(model)
+          .then(function (entity) {
+            var associations = this.associations;
+            var associationsKeysToUpdate = _.intersection(_.keys(associations), _.keys(data));
+            return upsertSubEntities.call(this, entity, associationsKeysToUpdate, data);
+          })
+          .then(function (entity) {
+            return this.getById(entity.id);
+          });
+        });
+      },
+      updateomatic: function (id, data) {
+        var model = this;
+        return sequelize.helpers.transaction(function () {
+          return model.getById(id)
+          .bind(model)
+          .then(function (entity) {
+            var updatable = _.pick(data, _.keys(this.schema().tableAttributes));
+            entity.set(updatable);
+            var associationsKeysToUpdate = _.intersection(_.keys(this.associations), _.keys(data));
+            return upsertSubEntities.call(this, entity, associationsKeysToUpdate, data);
+          })
+          .then(function (entity) {
+            return entity.save();
+          })
+          .then(function (entity) {
+            return this.getById(entity.id);
+          });
+        });
+      }
+    };
+
+    if (_.isUndefined(sequelize.options.define.classMethods)) {
+      sequelize.options.define.classMethods = {};
+    }
+
+    sequelize.options.define.classMethods.create = function () {
+      if (arguments.length === 1) {
+        return createomatic.call(this, arguments[0]);
+      } else {
+        return this.constructor.prototype.create.apply(this, arguments);
+      }
+    };
+
+    sequelize.options.define.classMethods.update = function (id, data) {
+      var numId = Number(id);
+      if(_.isNumber(numId)) {
+        return updateomatic.call(this, numId, data);
+      } else {
+        return this.constructor.prototype.update.apply(this, arguments);
+      }
+    };
+
     sequelize.hook('beforeFind', function (options) {
       var model = this;
       if (options.where) {
