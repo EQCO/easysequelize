@@ -2,10 +2,17 @@
 var _ = require('lodash'),
     cls = require('continuation-local-storage');
 
-module.exports = function (Sequelize) {
+module.exports = function (Sequelize, options) {
 
-  if (_.isUndefined(Sequelize.cls) || _.isNull(Sequelize.cls)) {
-    Sequelize.cls = cls.createNamespace('sequelize-internal');
+  options = _.defaults({
+    virtualFiltering: true,
+    advancedCreateUpdate: false
+  }, options);
+
+  if (options.advancedCreateUpdate) {
+    if (_.isUndefined(Sequelize.cls) || _.isNull(Sequelize.cls)) {
+      Sequelize.cls = cls.createNamespace('sequelize-internal');
+    }
   }
 
   function doUpsert(dataItem, association, associationModel, mainEntity) {
@@ -57,7 +64,7 @@ module.exports = function (Sequelize) {
 
   function upsertSubEntities(mainEntity, associations, data) {
     if (associations.length === 0) {
-      return Promise.resolve(mainEntity);
+      return Sequelize.Promise.resolve(mainEntity);
     } else {
       var promises = _(associations).map(function (associationKey) {
         var associationData = data[associationKey],
@@ -70,11 +77,11 @@ module.exports = function (Sequelize) {
               return item.Value !== item2.Value;
             });
           });
-          return Promise.join(Promise.all(_.map(associationData, function (dataItem) {
+          return Sequelize.Promise.join(Sequelize.Promise.all(_.map(associationData, function (dataItem) {
             if (!_.isNull(dataItem)) {
               return doUpsert(dataItem, association, associationModel, mainEntity);
             }
-          })), Promise.all(_.map(difference, function (dataItem) {
+          })), Sequelize.Promise.all(_.map(difference, function (dataItem) {
             return doDelete(dataItem, association, associationModel);
           })));
         } else if (!_.isNull(associationData) && !_.isUndefined(associationData)) {
@@ -84,7 +91,7 @@ module.exports = function (Sequelize) {
       .flatten()
       .value();
 
-      return Promise.all(promises)
+      return Sequelize.Promise.all(promises)
       .return(mainEntity);
     }
   }
@@ -184,22 +191,31 @@ module.exports = function (Sequelize) {
       sequelize.options.define.classMethods = {};
     }
 
-    sequelize.options.define.classMethods.create = function () {
-      if (arguments.length === 1) {
-        return createomatic.call(this, arguments[0]);
-      } else {
-        return this.constructor.prototype.create.apply(this, arguments);
-      }
-    };
+    if (options.advancedCreateUpdate) {
+      sequelize.options.define.classMethods.create = function () {
+        if (arguments.length === 1) {
+          return sequelize.helpers.createomatic.call(this, arguments[0]);
+        } else {
+          return this.constructor.prototype.create.apply(this, arguments);
+        }
+      };
 
-    sequelize.options.define.classMethods.update = function (id, data) {
-      var numId = Number(id);
-      if(_.isNumber(numId)) {
-        return updateomatic.call(this, numId, data);
-      } else {
-        return this.constructor.prototype.update.apply(this, arguments);
-      }
-    };
+      sequelize.options.define.classMethods.update = function (id, data) {
+        var numId = Number(id);
+        if(_.isNumber(numId)) {
+          return sequelize.helpers.updateomatic.call(this, numId, data);
+        } else {
+          return this.constructor.prototype.update.apply(this, arguments);
+        }
+      };
+
+      sequelize.options.define.classMethods.getById = function (id) {
+        return this.find({
+          where: { id: id },
+          include: [{ all: true }]
+        });
+      };
+    }
 
     sequelize.hook('beforeFind', function (options) {
       var model = this;
